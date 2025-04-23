@@ -613,10 +613,18 @@ _get_headers.has_logged = False
 def _get_files(compile_action):
     """Gets the ({source files}, {header files}) clangd should be told the command applies to."""
 
+    # If we've got swift action just return sources
+    if compile_action.mnemonic == 'SwiftCompile':
+        source_files = set(arg for arg in compile_action.arguments if arg.endswith('.swift'))
+        for source_file in source_files:
+            _warn_if_file_doesnt_exist(source_file)
+
+        return source_files, set()
+
     # Getting the source file is a little trickier than it might seem.
 
     # First, we do the obvious thing: Filter args to those that look like source files.
-    source_file_candidates = [arg for arg in compile_action.arguments if not arg.startswith('-') and arg.endswith(_get_files.source_extensions)]
+    source_file_candidates = [arg for arg in compile_action.arguments if not arg.startswith('-') and arg.endswith(_get_files.c_family_source_extensions)]
     assert source_file_candidates, f"No source files found in compile args: {compile_action.arguments}.\nPlease file an issue with this information!"
     source_file = source_file_candidates[0]
 
@@ -644,22 +652,10 @@ def _get_files(compile_action):
             source_index = compile_action.arguments.index('/c') + 1
 
         source_file = compile_action.arguments[source_index]
-        assert source_file.endswith(_get_files.source_extensions), f"Source file candidate, {source_file}, seems to be wrong.\nSelected from {compile_action.arguments}.\nPlease file an issue with this information!"
+        assert source_file.endswith(_get_files.c_family_source_extensions), f"Source file candidate, {source_file}, seems to be wrong.\nSelected from {compile_action.arguments}.\nPlease file an issue with this information!"
 
     # Warn gently about missing files
-    if not os.path.isfile(source_file):
-        if not _get_files.has_logged_missing_file_error: # Just log once; subsequent messages wouldn't add anything.
-            _get_files.has_logged_missing_file_error = True
-            log_warning(f""">>> A source file you compile doesn't (yet) exist: {source_file}
-    It's probably a generated file, and you haven't yet run a build to generate it.
-    That's OK; your code doesn't even have to compile for this tool to work.
-    If you can, though, you might want to run a build of your code with --keep_going.
-        That way everything possible is generated, browsable and indexed for autocomplete.
-    However, if you have *already* built your code, and generated the missing file...
-        Please make sure you're supplying this tool with the same flags you use to build.
-        You can either use a refresh_compile_commands rule or the special -- syntax. Please see the README.
-        [Supplying flags normally won't work. That just causes this tool to be built with those flags.]
-    Continuing gracefully...""")
+    if _warn_if_file_doesnt_exist(source_file):
         return {source_file}, set()
 
     # Note: We need to apply commands to headers and sources.
@@ -678,7 +674,7 @@ def _get_files(compile_action):
     # https://github.com/clangd/clangd/issues/1173
     # https://github.com/clangd/clangd/issues/1263
     if (any(header_file.endswith('.h') for header_file in header_files)
-        and not source_file.endswith(_get_files.c_source_extensions)
+        and not source_file.endswith(_get_files.c_family_source_extensions)
         and not any(arg.startswith('-x') or arg.startswith('--language') or arg.lower() in ('-objc', '-objc++', '/tc', '/tp') for arg in compile_action.arguments)):
         if compile_action.arguments[0].endswith('cl.exe'): # cl.exe and also clang-cl.exe
             lang_flag = '/TP' # https://docs.microsoft.com/en-us/cpp/build/reference/tc-tp-tc-tp-specify-source-file-type
@@ -713,6 +709,9 @@ _get_files.extensions_to_language_args = { # Note that clangd fails on the --lan
     _get_files.assembly_needing_c_preprocessor_source_extensions: '-xassembler-with-cpp',
 }
 _get_files.extensions_to_language_args = {ext : flag for exts, flag in _get_files.extensions_to_language_args.items() for ext in exts} # Flatten map for easier use
+# Keep C-family separate for Swift check
+_get_files.c_family_source_extensions = _get_files.source_extensions
+_get_files.source_extensions = _get_files.c_family_source_extensions + ('.swift',)
 
 
 @functools.lru_cache(maxsize=None)
@@ -733,17 +732,26 @@ def _get_apple_SDKROOT(SDK_name: str):
     # Traditionally stored in SDKROOT environment variable, but not provided by Bazel. See https://github.com/bazelbuild/bazel/issues/12852
 
 
-def _get_apple_platform(compile_args: typing.List[str]):
+def _get_apple_platform(compile_action):
     """Figure out which Apple platform a command is for.
 
     Is the name used by Xcode in the SDK files, not the marketing name.
     e.g. iPhoneOS, not iOS.
     """
     # A bit gross, but Bazel specifies the platform name in one of the include paths, so we mine it from there.
+    compile_args = compile_action.arguments
     for arg in compile_args:
         match = re.search('/Platforms/([a-zA-Z]+).platform/Developer/', arg)
         if match:
             return match.group(1)
+    # Fallback for Swift which might not have the include paths
+    if hasattr(compile_action, 'environmentVariables') and compile_action.environmentVariables:
+         match = next(
+             (pair for pair in compile_action.environmentVariables if pair.key == "APPLE_SDK_PLATFORM"),
+             None
+         )
+         if match:
+             return match.value
     return None
 
 
@@ -755,18 +763,20 @@ def _get_apple_DEVELOPER_DIR():
     # Traditionally stored in DEVELOPER_DIR environment variable, but not provided by Bazel. See https://github.com/bazelbuild/bazel/issues/12852
 
 
-def _apple_platform_patch(compile_args: typing.List[str]):
+def _apple_platform_patch(compile_action):
     """De-Bazel the command into something clangd can parse.
 
     This function has fixes specific to Apple platforms, but you should call it on all platforms. It'll determine whether the fixes should be applied or not.
     """
     # Bazel internal environment variable fragment that distinguishes Apple platforms that need unwrapping.
         # Note that this occurs in the Xcode-installed wrapper, but not the CommandLineTools wrapper, which works fine as is.
+    compile_args = compile_action.arguments
     if any('__BAZEL_XCODE_' in arg for arg in compile_args):
         # Undo Bazel's Apple platform compiler wrapping.
         # Bazel wraps the compiler as `external/local_config_cc/wrapped_clang` and exports that wrapped compiler in the proto. However, we need a clang call that clangd can introspect. (See notes in "how clangd uses compile_commands.json" in ImplementationReadme.md for more.)
         # Removing the wrapper is also important because Bazel's Xcode (but not CommandLineTools) wrapper crashes if you don't specify particular environment variables (replaced below). We'd need the wrapper to be invokable by clangd's --query-driver if we didn't remove the wrapper.
-        compile_args[0] = 'clang'
+        if compile_action.mnemonic != 'SwiftCompile': # Don't replace swiftc
+            compile_args[0] = 'clang'
 
         # We have to manually substitute out Bazel's macros so clang can parse the command
         # Code this mirrors is in https://github.com/bazelbuild/bazel/blob/master/tools/osx/crosstool/wrapped_clang.cc
@@ -775,9 +785,32 @@ def _apple_platform_patch(compile_args: typing.List[str]):
         # We also have to manually figure out the values of SDKROOT and DEVELOPER_DIR, since they're missing from the environment variables Bazel provides.
         # Filed Bazel issue about the missing environment variables: https://github.com/bazelbuild/bazel/issues/12852
         compile_args = [arg.replace('__BAZEL_XCODE_DEVELOPER_DIR__', _get_apple_DEVELOPER_DIR()) for arg in compile_args]
-        apple_platform = _get_apple_platform(compile_args)
+        apple_platform = _get_apple_platform(compile_action)
         assert apple_platform, f"Apple platform not detected in CMD: {compile_args}"
         compile_args = [arg.replace('__BAZEL_XCODE_SDKROOT__', _get_apple_SDKROOT(apple_platform)) for arg in compile_args]
+
+    return compile_args
+
+
+def _swift_patch(compile_action):
+    """De-Bazel the command into something sourecekit-lsp can parse.
+
+    This function has fixes specific to Swift, but you should call it on all platforms. It'll determine whether the fixes should be applied or not.
+    """
+
+    compile_args = compile_action.arguments
+    if compile_action.mnemonic == 'SwiftCompile':
+        # rules_swift add a worker for wrapping if enable --persistent_worker flag (https://bazel.build/remote/persistent)
+        # https://github.com/bazelbuild/rules_swift/blob/master/swift/internal/actions.bzl#L236
+        # We need to remove it (build_bazel_rules_swift/tools/worker/worker)
+        while len(compile_args) > 0 and (not 'swiftc' in compile_args[0]):
+            compile_args.pop(0)
+
+        assert len(compile_args) > 0, "No compiler found in swift_path"
+        compile_args[0] = 'swiftc'
+
+        # Remove -Xwrapped-swift introduced by rules_swift
+        compile_args = [arg for arg in compile_args if not arg.startswith('-Xwrapped-swift')]
 
     return compile_args
 
@@ -891,6 +924,11 @@ def _all_platform_patch(compile_args: typing.List[str]):
             real_compiler_path = shutil.which(compiler)
             if real_compiler_path:
                 compile_args[0] = real_compiler_path
+
+    # Swap -isysroot for --sysroot to work around (probably) https://github.com/clangd/clangd/issues/1305
+    # For context, see https://github.com/clangd/clangd/issues/1305
+    # The = logic has to do with clang not accepting -isysroot=, but accepting --sysroot=. Note that -isysroot <path> is accepted, though undocumented.
+    compile_args = ('-isysroot'+arg[len('--sysroot')+arg.startswith('--sysroot='):] if arg.startswith('--sysroot') else arg for arg in compile_args)
 
     # Any other general fixes would go here...
 
@@ -1392,6 +1430,25 @@ def _ensure_cwd_is_workspace_root():
     # Change the working directory to the workspace root (assumed by future commands).
     # Although this can fail (OSError/FileNotFoundError/PermissionError/NotADirectoryError), there's no easy way to recover, so we'll happily crash.
     os.chdir(workspace_root)
+
+
+def _warn_if_file_doesnt_exist(source_file):
+    if not os.path.isfile(source_file):
+        if not _warn_if_file_doesnt_exist.has_logged_missing_file_error: # Just log once; subsequent messages wouldn't add anything.
+            _warn_if_file_doesnt_exist.has_logged_missing_file_error = True
+            log_warning(f""">>> A source file you compile doesn't (yet) exist: {source_file}
+    It's probably a generated file, and you haven't yet run a build to generate it.
+    That's OK; your code doesn't even have to compile for this tool to work.
+    If you can, though, you might want to run a build of your code with --keep_going.
+        That way everything possible is generated, browsable and indexed for autocomplete.
+    However, if you have *already* built your code, and generated the missing file...
+        Please make sure you're supplying this tool with the same flags you use to build.
+        You can either use a refresh_compile_commands rule or the special -- syntax. Please see the README.
+        [Supplying flags normally won't work. That just causes this tool to be built with those flags.]
+    Continuing gracefully...""")
+        return True
+    return False
+_warn_if_file_doesnt_exist.has_logged_missing_file_error = False
 
 
 def main():
