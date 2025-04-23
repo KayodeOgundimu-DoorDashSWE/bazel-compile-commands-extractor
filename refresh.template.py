@@ -943,7 +943,7 @@ def _all_platform_patch(compile_args: typing.List[str]):
 
     # Any other general fixes would go here...
 
-    return compile_args
+    return list(compile_args) # Convert generator back to list
 
 
 def _nvcc_patch(compile_args: typing.List[str]) -> typing.List[str]:
