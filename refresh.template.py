@@ -763,33 +763,44 @@ def _get_apple_DEVELOPER_DIR():
     # Traditionally stored in DEVELOPER_DIR environment variable, but not provided by Bazel. See https://github.com/bazelbuild/bazel/issues/12852
 
 
-def _apple_platform_patch(compile_action):
+def _apple_platform_patch(compile_args: typing.List[str], compile_action_mnemonic: typing.Optional[str] = None, compile_action_env: typing.Optional[typing.Dict[str, str]] = None):
     """De-Bazel the command into something clangd can parse.
 
     This function has fixes specific to Apple platforms, but you should call it on all platforms. It'll determine whether the fixes should be applied or not.
     """
     # Bazel internal environment variable fragment that distinguishes Apple platforms that need unwrapping.
         # Note that this occurs in the Xcode-installed wrapper, but not the CommandLineTools wrapper, which works fine as is.
-    compile_args = compile_action.arguments
-    if any('__BAZEL_XCODE_' in arg for arg in compile_args):
+
+    # Create a copy to avoid modifying the original list passed in
+    patched_compile_args = list(compile_args)
+
+    if any('__BAZEL_XCODE_' in arg for arg in patched_compile_args):
         # Undo Bazel's Apple platform compiler wrapping.
         # Bazel wraps the compiler as `external/local_config_cc/wrapped_clang` and exports that wrapped compiler in the proto. However, we need a clang call that clangd can introspect. (See notes in "how clangd uses compile_commands.json" in ImplementationReadme.md for more.)
         # Removing the wrapper is also important because Bazel's Xcode (but not CommandLineTools) wrapper crashes if you don't specify particular environment variables (replaced below). We'd need the wrapper to be invokable by clangd's --query-driver if we didn't remove the wrapper.
-        if compile_action.mnemonic != 'SwiftCompile': # Don't replace swiftc
-            compile_args[0] = 'clang'
+        if compile_action_mnemonic != 'SwiftCompile': # Don't replace swiftc
+            patched_compile_args[0] = 'clang'
 
         # We have to manually substitute out Bazel's macros so clang can parse the command
         # Code this mirrors is in https://github.com/bazelbuild/bazel/blob/master/tools/osx/crosstool/wrapped_clang.cc
         # Not complete--we're just swapping out the essentials, because there seems to be considerable turnover in the hacks they have in the wrapper.
-        compile_args = [arg for arg in compile_args if not arg.startswith('DEBUG_PREFIX_MAP_PWD') or arg == 'OSO_PREFIX_MAP_PWD'] # No need for debug prefix maps if compiling in place, not that we're compiling anyway.
+        patched_compile_args = [arg for arg in patched_compile_args if not arg.startswith('DEBUG_PREFIX_MAP_PWD') or arg == 'OSO_PREFIX_MAP_PWD'] # No need for debug prefix maps if compiling in place, not that we're compiling anyway.
         # We also have to manually figure out the values of SDKROOT and DEVELOPER_DIR, since they're missing from the environment variables Bazel provides.
         # Filed Bazel issue about the missing environment variables: https://github.com/bazelbuild/bazel/issues/12852
-        compile_args = [arg.replace('__BAZEL_XCODE_DEVELOPER_DIR__', _get_apple_DEVELOPER_DIR()) for arg in compile_args]
-        apple_platform = _get_apple_platform(compile_action)
-        assert apple_platform, f"Apple platform not detected in CMD: {compile_args}"
-        compile_args = [arg.replace('__BAZEL_XCODE_SDKROOT__', _get_apple_SDKROOT(apple_platform)) for arg in compile_args]
+        patched_compile_args = [arg.replace('__BAZEL_XCODE_DEVELOPER_DIR__', _get_apple_DEVELOPER_DIR()) for arg in patched_compile_args]
 
-    return compile_args
+        # We need the original compile_action object (or parts of it) to get the platform
+        # Create a temporary SimpleNamespace to mimic the structure needed by _get_apple_platform
+        temp_compile_action = types.SimpleNamespace()
+        temp_compile_action.arguments = patched_compile_args # Use the potentially modified args for platform detection
+        if compile_action_env is not None:
+             temp_compile_action.environmentVariables = compile_action_env
+
+        apple_platform = _get_apple_platform(temp_compile_action)
+        assert apple_platform, f"Apple platform not detected in CMD: {patched_compile_args}"
+        patched_compile_args = [arg.replace('__BAZEL_XCODE_SDKROOT__', _get_apple_SDKROOT(apple_platform)) for arg in patched_compile_args]
+
+    return patched_compile_args
 
 
 def _swift_patch(compile_action):
@@ -1146,17 +1157,21 @@ def _get_cpp_command_for_files(compile_action):
         compile_action.environmentVariables['PATH'] = os.environ['PATH']
 
     # Patch command by platform, revealing any hidden arguments.
-    compile_action.arguments = _apple_platform_patch(compile_action.arguments)
-    compile_action.arguments = _emscripten_platform_patch(compile_action)
+    # Pass necessary parts of compile_action to _apple_platform_patch
+    patched_args = _apple_platform_patch(compile_action.arguments, compile_action.mnemonic, compile_action.environmentVariables)
+    patched_args = _emscripten_platform_patch(types.SimpleNamespace(arguments=patched_args, environmentVariables=compile_action.environmentVariables)) # Emscripten needs env too
     # Android and Linux and grailbio LLVM toolchains: Fine as is; no special patching needed.
-    compile_action.arguments = _all_platform_patch(compile_action.arguments)
+    patched_args = _all_platform_patch(patched_args)
 
-    source_files, header_files = _get_files(compile_action)
+    source_files, header_files = _get_files(compile_action) # Get files *before* nvcc patch, which might execute nvcc
 
     # Done after getting files since we may execute NVCC to get the files.
-    compile_action.arguments = _nvcc_patch(compile_action.arguments)
+    final_args = _nvcc_patch(patched_args)
 
-    return source_files, header_files, compile_action.arguments
+    # Update compile_action.arguments with the fully patched list for consistency if needed later, though current logic uses final_args
+    compile_action.arguments = final_args
+
+    return source_files, header_files, final_args
 
 
 def _convert_compile_commands(aquery_output):
